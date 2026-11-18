@@ -295,59 +295,78 @@ async def delete_task_messages_from_group(bot: Bot, task_id: int):
             pass
 
 
+def _split_long_html_text(text: str, limit: int = 4000) -> list[str]:
+    """Разбивает слишком длинный текст (свыше 4096 символов) на безопасные части для Telegram."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        split_idx = text.rfind("\n", 0, limit)
+        if split_idx == -1:
+            split_idx = limit
+        chunks.append(text[:split_idx])
+        text = text[split_idx:].lstrip("\n")
+    return chunks
+
+
 async def post_task_to_chat(bot: Bot, task_payload: dict, task_id: int):
     """
     Публикует задачу в общий чат:
-    1) Карточку задачи + фото/документы (до 10 шт.)
-    2) ВСЕГДА отдельным финальным сообщением прикрепляет кнопку «Взять в работу»,
-       чтобы кнопка гарантированно отображалась при любом наборе вложений.
+    1) Текст карточки задачи отдельным сообщением (лимит 4096 символов вместо 1024 у caption)
+    2) Альбом/фото и все документы (без длинной подписи, чтобы не ловить caption is too long)
+    3) Отдельное финальное сообщение с кнопкой «Взять в работу»
     """
-    creator_link = build_user_link(task_payload["creator_name"], task_payload.get("creator_username"), task_payload["creator_id"])
+    creator_link = build_user_link(
+        task_payload["creator_name"],
+        task_payload.get("creator_username"),
+        task_payload["creator_id"]
+    )
     task_card_text = format_task_text(task_payload, creator_link)
 
     photos = _extract_file_ids(task_payload.get("reference_photos", []))
     docs = _extract_file_ids(task_payload.get("reference_docs", []))
     all_ids = []
 
+    # 1. Отправляем текст задачи (с поддержкой длинного ТЗ до 4096+ символов)
+    text_chunks = _split_long_html_text(task_card_text, limit=4000)
+    for chunk in text_chunks:
+        try:
+            sent_text = await bot.send_message(
+                chat_id=config.MAIN_CHAT_ID,
+                text=chunk,
+                disable_web_page_preview=True
+            )
+            all_ids.append(sent_text.message_id)
+        except Exception:
+            # Fallback без HTML-разметки, если при разбивке разорвался тег
+            plain_chunk = re.sub(r"<[^>]+>", "", chunk)
+            sent_text = await bot.send_message(
+                chat_id=config.MAIN_CHAT_ID,
+                text=plain_chunk,
+                parse_mode=None,
+                disable_web_page_preview=True
+            )
+            all_ids.append(sent_text.message_id)
+
+    # 2. Отправляем все фото (альбомом или одиночным фото)
     if photos:
         if len(photos) > 1:
-            media = [InputMediaPhoto(media=photos[0], caption=task_card_text)]
-            for pid in photos[1:10]:
-                media.append(InputMediaPhoto(media=pid))
+            media = [InputMediaPhoto(media=pid) for pid in photos[:10]]
             sent_messages = await bot.send_media_group(chat_id=config.MAIN_CHAT_ID, media=media)
             all_ids.extend([m.message_id for m in sent_messages])
         else:
-            sent_msg = await bot.send_photo(
-                chat_id=config.MAIN_CHAT_ID,
-                photo=photos[0],
-                caption=task_card_text
-            )
-            all_ids.append(sent_msg.message_id)
+            sent_photo = await bot.send_photo(chat_id=config.MAIN_CHAT_ID, photo=photos[0])
+            all_ids.append(sent_photo.message_id)
 
-        for doc_id in docs:
-            dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
-            all_ids.append(dm.message_id)
+    # 3. Отправляем все документы
+    for doc_id in docs:
+        dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
+        all_ids.append(dm.message_id)
 
-    elif docs:
-        sent_msg = await bot.send_document(
-            chat_id=config.MAIN_CHAT_ID,
-            document=docs[0],
-            caption=task_card_text
-        )
-        all_ids.append(sent_msg.message_id)
-        for doc_id in docs[1:]:
-            dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
-            all_ids.append(dm.message_id)
-
-    else:
-        sent_msg = await bot.send_message(
-            chat_id=config.MAIN_CHAT_ID,
-            text=task_card_text,
-            disable_web_page_preview=True
-        )
-        all_ids.append(sent_msg.message_id)
-
-    # Всегда отправляем отдельное сообщение с кнопкой принятия задачи
+    # 4. Всегда отправляем отдельное сообщение с кнопкой принятия задачи
     btn_msg = await bot.send_message(
         chat_id=config.MAIN_CHAT_ID,
         text=f"👆 <b>Задача #{task_id}</b> («{html.escape(task_payload['theme'])}»): нажмите кнопку ниже, чтобы взять в работу",
