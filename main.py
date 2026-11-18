@@ -8,7 +8,7 @@ from aiohttp import web
 
 import config
 import database as db
-from handlers import router
+from handlers import router, restore_active_dialogs_for_all
 from middlewares import MediaGroupMiddleware
 from scheduler import setup_scheduler
 from webapp import create_webapp_app
@@ -30,8 +30,7 @@ async def main():
     )
     
     dp = Dispatcher()
-    # Регистрируем middleware для склейки пачек фото
-    dp.message.middleware(MediaGroupMiddleware(latency=0.6))
+    dp.message.middleware(MediaGroupMiddleware(latency=0.8))
     dp.include_router(router)
 
     scheduler = setup_scheduler(bot)
@@ -44,9 +43,10 @@ async def main():
     await site.start()
     logging.info(f"Веб-сервер Mini App запущен на http://{config.WEBAPP_HOST}:{config.WEBAPP_PORT}")
 
-    logging.info("Бот успешно запущен!")
+    logging.info("Бот успешно запущен! Восстанавливаем активные диалоговые окна...")
+    await restore_active_dialogs_for_all(bot)
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         scheduler.shutdown()
         await runner.cleanup()

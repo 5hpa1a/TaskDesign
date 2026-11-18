@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone, timedelta
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8986044239:AAHTzbb06EP4PYZIzxpIQwGKR2jTEa7T7yE")
 MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "-1003789825003"))
@@ -6,10 +7,17 @@ MAIN_CHAT_ID = int(os.getenv("MAIN_CHAT_ID", "-1003789825003"))
 ADMINS_FILE = "admins.txt"
 DB_NAME = "bot.db"
 
+# Строгий часовой пояс UTC+3 (Москва)
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def now_msk() -> datetime:
+    """Возвращает текущее время строго по UTC+3 (naive datetime для совместимости с БД)."""
+    return datetime.now(MSK_TZ).replace(tzinfo=None)
+
+
 # Настройки для Mini App (Web App)
-# ВАЖНО: Telegram требует только HTTPS URL!
-# Для тестов на локальной машине используйте ngrok: ngrok http 8080
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://whinny-routing-headfirst.ngrok-free.dev")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://vpdesign.duckdns.org")
 WEBAPP_HOST = os.getenv("WEBAPP_HOST", "0.0.0.0")
 WEBAPP_PORT = int(os.getenv("WEBAPP_PORT", "8080"))
 

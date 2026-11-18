@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncio
 import re
 import html
@@ -6,9 +6,10 @@ from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 import config
+from config import now_msk
 import database as db
 from states import RegistrationState, TaskCreationState, TaskEditState
 from keyboards import (
@@ -20,22 +21,19 @@ from keyboards import (
     get_designer_task_control_keyboard,
     get_creator_confirmation_keyboard,
     get_user_task_item_keyboard,
+    get_admin_task_control_keyboard,
+    get_completed_task_reopen_keyboard,
 )
 
 router = Router()
 
 DESIGNER_TITLES = ["дизайнер", "арт-директор", "head of design"]
+MAX_ATTACHMENTS = 10
 
-# Хранилище ID сообщений последнего вызова «Мои задачи» заказчика
 user_my_tasks_messages: dict[int, list[int]] = {}
-
-# Хранилище ID сообщений вызова «Мои задачи в работе» дизайнера (включая заголовок)
 user_designer_tasks_messages: dict[int, list[int]] = {}
-
-# Хранилище сообщений ввода команд пользователя
+admin_manage_tasks_messages: dict[int, list[int]] = {}
 user_last_command_message: dict[int, int] = {}
-
-# Хранилище фоновых асинхронных уведомлений (удаляются при нажатии пользователем любой кнопки в боте)
 pending_async_notices: dict[int, list[int]] = {}
 
 
@@ -45,14 +43,37 @@ def is_designer_position(position: str | None) -> bool:
     return any(title in position.lower() for title in DESIGNER_TITLES)
 
 
+def calculate_next_workday_end_msk(from_dt: datetime | None = None) -> datetime:
+    """
+    Вычисляет 18:00 следующего рабочего дня (пн–пт) строго по UTC+3:
+    - Пн–Чт -> следующий календарный день в 18:00
+    - Пт -> Понедельник (+3 дня) в 18:00
+    - Сб -> Понедельник (+2 дня) в 18:00
+    - Вс -> Понедельник (+1 день) в 18:00
+    """
+    dt = from_dt or now_msk()
+    wd = dt.weekday()  # 0=Пн, ..., 4=Пт, 5=Сб, 6=Вс
+    if wd == 4:      # Пятница -> Понедельник
+        days_to_add = 3
+    elif wd == 5:    # Суббота -> Понедельник
+        days_to_add = 2
+    else:            # Пн–Чт или Вс -> следующий день
+        days_to_add = 1
+
+    target = (dt + timedelta(days=days_to_add)).replace(hour=18, minute=0, second=0, microsecond=0)
+    return target
+
+
 def parse_deadline(text: str) -> tuple[datetime | None, str]:
-    now = datetime.now()
+    now = now_msk()
     clean_text = text.strip()
-    formats = [
+
+    # Форматы с явным указанием времени
+    formats_with_time = [
         "%d.%m.%Y %H:%M", "%d.%m.%Y %H", "%d.%m %H:%M",
-        "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M", "%d.%m",
+        "%d-%m-%Y %H:%M", "%d/%m/%Y %H:%M",
     ]
-    for fmt in formats:
+    for fmt in formats_with_time:
         try:
             dt = datetime.strptime(clean_text, fmt)
             if dt.year == 1900:
@@ -61,16 +82,31 @@ def parse_deadline(text: str) -> tuple[datetime | None, str]:
         except ValueError:
             continue
 
+    # Форматы только с датой (без времени) -> дедлайн наступает в 00:00 СЛЕДУЮЩЕГО дня
+    formats_date_only = ["%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y", "%d.%m", "%d-%m", "%d/%m"]
+    for fmt in formats_date_only:
+        try:
+            dt = datetime.strptime(clean_text, fmt)
+            if dt.year == 1900:
+                dt = dt.replace(year=now.year)
+            next_day_midnight = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            return next_day_midnight, clean_text
+        except ValueError:
+            continue
+
+    # Поиск даты (и опционально времени) внутри произвольной строки
     match = re.search(r'(\d{1,2})[./\-](\d{1,2})(?:[./\-](\d{2,4}))?(?:\s+(\d{1,2}):(\d{2}))?', clean_text)
     if match:
         day, month, year, hour, minute = match.groups()
         yr = int(year) if year else now.year
         if yr < 100:
             yr += 2000
-        hr = int(hour) if hour else 18
-        mn = int(minute) if minute else 0
         try:
-            return datetime(yr, int(month), int(day), hr, mn), clean_text
+            if hour is not None:
+                return datetime(yr, int(month), int(day), int(hour), int(minute)), clean_text
+            else:
+                base_date = datetime(yr, int(month), int(day), 0, 0)
+                return base_date + timedelta(days=1), clean_text
         except ValueError:
             pass
 
@@ -89,7 +125,7 @@ def calculate_time_left(deadline_dt_str: str | None, raw_deadline: str) -> str:
     if not dt:
         return "Не указано"
 
-    diff = dt - datetime.now()
+    diff = dt - now_msk()
     if diff.total_seconds() <= 0:
         return "⚠️ Дедлайн прошёл"
 
@@ -113,9 +149,19 @@ def build_user_link(name: str, username: str | None, user_id: int) -> str:
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
-def format_task_text(task_data: dict, creator_link: str) -> str:
+def _extract_file_ids(items: list) -> list[str]:
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            result.append(item["file_id"])
+        else:
+            result.append(str(item))
+    return result
+
+
+def format_task_text(task_data: dict, creator_link: str, header: str = "📋 <b>Новая задача!</b>") -> str:
     creator_position = html.escape(task_data.get("creator_position") or "Сотрудник")
-    created_at = task_data.get("created_at") or datetime.now().strftime("%d.%m.%Y %H:%M")
+    created_at = task_data.get("created_at") or now_msk().strftime("%d.%m.%Y %H:%M")
     time_left = calculate_time_left(task_data.get("deadline_dt"), task_data.get("deadline", ""))
 
     ref_data = task_data.get("reference_data")
@@ -142,8 +188,10 @@ def format_task_text(task_data: dict, creator_link: str) -> str:
 
     escaped_description = html.escape(task_data.get('description', ''))
 
+    header_block = f"{header}\n\n" if header else ""
+
     return (
-        f"📋 <b>Новая задача!</b>\n\n"
+        f"{header_block}"
         f"👤 <b>Заказчик:</b> {creator_link} ({creator_position})\n"
         f"📅 <b>Дата постановки:</b> {created_at}\n\n"
         f"📌 <b>Тема:</b> {html.escape(task_data['theme'])}\n"
@@ -160,14 +208,34 @@ def format_user_card_text(t: dict) -> str:
     status_names = {
         "pending": "⏳ Ищет дизайнера (в чате)",
         "in_progress": "🛠 В работе у дизайнера",
-        "awaiting_confirmation": "🧐 Ожидает вашего подтверждения"
+        "awaiting_confirmation": "🧐 Ожидает вашего подтверждения",
+        "completed": "✅ Выполнена (доступна для переоткрытия 7 дн.)"
     }
     designer_info = f" (Дизайнер: {html.escape(t['designer_name'])})" if t.get("designer_name") else ""
-    time_left = calculate_time_left(t.get("deadline_dt"), t.get("deadline", ""))
     escaped_desc = html.escape(t.get("description", "—"))
+
+    if t["status"] == "completed":
+        completed_str = t.get("completed_at") or "—"
+        return (
+            f"<b>Задача #{t['id']}: {html.escape(t['theme'])}</b>\n"
+            f"<b>Статус:</b> {status_names['completed']}{designer_info}\n"
+            f"<b>Завершена:</b> {html.escape(completed_str)}\n"
+            f"<b>Форматы:</b> {html.escape(t['formats'])}\n"
+            f"<b>ТЗ:</b>\n<blockquote expandable>{escaped_desc}</blockquote>\n"
+        )
+
+    time_left = calculate_time_left(t.get("deadline_dt"), t.get("deadline", ""))
+    auto_note = ""
+    if t.get("status") == "awaiting_confirmation" and t.get("auto_approve_at"):
+        try:
+            aa_dt = datetime.fromisoformat(t["auto_approve_at"])
+            auto_note = f"\n⏱ <b>Автоподтверждение:</b> {aa_dt.strftime('%d.%m.%Y в %H:%M')} (UTC+3)"
+        except Exception:
+            pass
+
     return (
         f"<b>Задача #{t['id']}: {html.escape(t['theme'])}</b>\n"
-        f"<b>Статус:</b> {status_names.get(t['status'], t['status'])}{designer_info}\n"
+        f"<b>Статус:</b> {status_names.get(t['status'], t['status'])}{designer_info}{auto_note}\n"
         f"<b>Дедлайн:</b> {html.escape(t['deadline'])} (осталось: <code>{time_left}</code>)\n"
         f"<b>Форматы:</b> {html.escape(t['formats'])}\n"
         f"<b>ТЗ:</b>\n<blockquote expandable>{escaped_desc}</blockquote>\n"
@@ -175,7 +243,6 @@ def format_user_card_text(t: dict) -> str:
 
 
 async def clear_user_pending_notices(bot: Bot, user_id: int):
-    """Удаляет фоновые асинхронные уведомления, когда пользователь снова активен в боте."""
     if user_id in pending_async_notices:
         for mid in pending_async_notices[user_id]:
             try:
@@ -186,7 +253,6 @@ async def clear_user_pending_notices(bot: Bot, user_id: int):
 
 
 async def handle_user_command_cleanup(bot: Bot, chat_id: int, user_id: int, current_message_id: int):
-    """Очищает предыдущую команду пользователя и фоновые уведомления."""
     await clear_user_pending_notices(bot, user_id)
     prev_msg_id = user_last_command_message.get(user_id)
     if prev_msg_id and prev_msg_id != current_message_id:
@@ -196,9 +262,16 @@ async def handle_user_command_cleanup(bot: Bot, chat_id: int, user_id: int, curr
             pass
     user_last_command_message[user_id] = current_message_id
 
+async def safe_callback_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False):
+    """Безопасный ответ на callback_query без падения при истечении таймаута Telegram."""
+    try:
+        await callback.answer(text=text, show_alert=show_alert)
+    except TelegramBadRequest:
+        pass
+    except Exception:
+        pass
 
 async def delete_later(bot: Bot, chat_id: int, message_id: int, delay: int = 5):
-    """Фоновое удаление сообщений через заданный интервал (5-10 сек)."""
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -223,68 +296,117 @@ async def delete_task_messages_from_group(bot: Bot, task_id: int):
 
 
 async def post_task_to_chat(bot: Bot, task_payload: dict, task_id: int):
+    """
+    Публикует задачу в общий чат:
+    1) Карточку задачи + фото/документы (до 10 шт.)
+    2) ВСЕГДА отдельным финальным сообщением прикрепляет кнопку «Взять в работу»,
+       чтобы кнопка гарантированно отображалась при любом наборе вложений.
+    """
     creator_link = build_user_link(task_payload["creator_name"], task_payload.get("creator_username"), task_payload["creator_id"])
     task_card_text = format_task_text(task_payload, creator_link)
 
-    photos = task_payload.get("reference_photos", [])
-    docs = task_payload.get("reference_docs", [])
+    photos = _extract_file_ids(task_payload.get("reference_photos", []))
+    docs = _extract_file_ids(task_payload.get("reference_docs", []))
     all_ids = []
 
     if photos:
         if len(photos) > 1:
             media = [InputMediaPhoto(media=photos[0], caption=task_card_text)]
-            for pid in photos[1:]:
+            for pid in photos[1:10]:
                 media.append(InputMediaPhoto(media=pid))
             sent_messages = await bot.send_media_group(chat_id=config.MAIN_CHAT_ID, media=media)
             all_ids.extend([m.message_id for m in sent_messages])
-            
-            for doc_id in docs:
-                dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
-                all_ids.append(dm.message_id)
-
-            btn_msg = await bot.send_message(
-                chat_id=config.MAIN_CHAT_ID,
-                text=f"👆 Задача #{task_id}: нажмите кнопку ниже, чтобы взять в работу",
-                reply_markup=get_task_take_keyboard(task_id)
-            )
-            all_ids.append(btn_msg.message_id)
-            await db.update_task_group_messages(task_id, config.MAIN_CHAT_ID, all_ids)
-            return
         else:
             sent_msg = await bot.send_photo(
                 chat_id=config.MAIN_CHAT_ID,
                 photo=photos[0],
-                caption=task_card_text,
-                reply_markup=get_task_take_keyboard(task_id)
+                caption=task_card_text
             )
             all_ids.append(sent_msg.message_id)
-            for doc_id in docs:
-                dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
-                all_ids.append(dm.message_id)
-            await db.update_task_group_messages(task_id, config.MAIN_CHAT_ID, all_ids)
-            return
 
-    if docs:
+        for doc_id in docs:
+            dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
+            all_ids.append(dm.message_id)
+
+    elif docs:
         sent_msg = await bot.send_document(
             chat_id=config.MAIN_CHAT_ID,
             document=docs[0],
-            caption=task_card_text,
-            reply_markup=get_task_take_keyboard(task_id)
+            caption=task_card_text
         )
         all_ids.append(sent_msg.message_id)
         for doc_id in docs[1:]:
             dm = await bot.send_document(chat_id=config.MAIN_CHAT_ID, document=doc_id)
             all_ids.append(dm.message_id)
-        await db.update_task_group_messages(task_id, config.MAIN_CHAT_ID, all_ids)
-        return
 
-    sent_msg = await bot.send_message(
+    else:
+        sent_msg = await bot.send_message(
+            chat_id=config.MAIN_CHAT_ID,
+            text=task_card_text,
+            disable_web_page_preview=True
+        )
+        all_ids.append(sent_msg.message_id)
+
+    # Всегда отправляем отдельное сообщение с кнопкой принятия задачи
+    btn_msg = await bot.send_message(
         chat_id=config.MAIN_CHAT_ID,
-        text=task_card_text,
-        reply_markup=get_task_take_keyboard(task_id),
+        text=f"👆 <b>Задача #{task_id}</b> («{html.escape(task_payload['theme'])}»): нажмите кнопку ниже, чтобы взять в работу",
+        reply_markup=get_task_take_keyboard(task_id)
+    )
+    all_ids.append(btn_msg.message_id)
+    await db.update_task_group_messages(task_id, config.MAIN_CHAT_ID, all_ids)
+
+
+async def send_task_with_files_to_designer(bot: Bot, designer_id: int, task: dict, is_restore: bool = False):
+    """
+    Отправляет дизайнеру в ЛС:
+    1) Актуальную Reply-клавиатуру меню, чтобы кнопки меню не пропадали после взятия задачи
+    2) Все прикреплённые фото и документы
+    3) Карточку задачи БЕЗ заголовка «Новая задача!» с кнопками «Выполнено» / «Отказаться»
+    """
+    designer_user = await db.get_user(designer_id)
+    is_adm = config.is_admin(designer_id)
+    is_des = is_designer_position(designer_user[2]) if designer_user else True
+
+    # Явно закрепляем нижнюю клавиатуру меню для дизайнера
+    prefix_title = (
+        f"🔄 <b>Восстановлена активная задача #{task['id']}:</b>"
+        if is_restore else
+        f"🎯 <b>Вы взяли задачу #{task['id']} в работу:</b>"
+    )
+    await bot.send_message(
+        chat_id=designer_id,
+        text=prefix_title,
+        reply_markup=get_main_menu_keyboard(is_adm, is_des, user_id=designer_id)
+    )
+
+    photos = _extract_file_ids(task.get("reference_photos", []))
+    docs = _extract_file_ids(task.get("reference_docs", []))
+
+    if photos:
+        if len(photos) > 1:
+            media = [InputMediaPhoto(media=pid) for pid in photos[:10]]
+            await bot.send_media_group(chat_id=designer_id, media=media)
+        else:
+            await bot.send_photo(chat_id=designer_id, photo=photos[0])
+
+    for doc_id in docs:
+        await bot.send_document(chat_id=designer_id, document=doc_id)
+
+    creator_link = build_user_link(task["creator_name"], task.get("creator_username"), task["creator_id"])
+    # Передаём header="" — заголовок «Новая задача!» отсутствует
+    task_info = format_task_text(task, creator_link, header="")
+    pm_text = (
+        f"{task_info}"
+        "Когда закончите работу, нажмите «Выполнено». Если передумали — «Отказаться»."
+    )
+
+    await bot.send_message(
+        chat_id=designer_id,
+        text=pm_text,
+        reply_markup=get_designer_task_control_keyboard(task["id"]),
         disable_web_page_preview=True
     )
-    await db.update_task_group_messages(task_id, config.MAIN_CHAT_ID, [sent_msg.message_id])
 
 
 async def track_msg(state: FSMContext, message_id: int):
@@ -324,6 +446,186 @@ async def cleanup_fsm_messages(bot: Bot, chat_id: int, state: FSMContext):
         except Exception:
             pass
 
+async def execute_designer_take_task(bot: Bot, task_id: int, designer_id: int, username: str | None = None) -> tuple[bool, str]:
+    """Общая логика взятия задачи в работу (из чата или из Mini App)."""
+    designer_user = await db.get_user(designer_id)
+    if not designer_user or not is_designer_position(designer_user[2]):
+        return False, "Брать задачи могут только сотрудники с должностью дизайнера."
+
+    designer_display_name = designer_user[1]
+    designer_username = username or designer_user[3]
+
+    success = await db.assign_task_to_designer(task_id, designer_id, designer_display_name)
+    if not success:
+        return False, "Задача уже взята другим дизайнером или отменена."
+
+    # Обновляем кнопку в общем чате на «Взял(-а): ...»
+    taken_label = f"@{designer_username}" if designer_username else designer_display_name
+    group_msg_ids = await db.get_task_messages_ids(task_id)
+    if group_msg_ids:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=config.MAIN_CHAT_ID,
+                message_id=group_msg_ids[-1],
+                reply_markup=get_task_taken_placeholder(taken_label)
+            )
+        except Exception:
+            pass
+
+    task = await db.get_task(task_id)
+
+    # 1. Дублируем задачу со всеми файлами и кнопками управления в ЛС дизайнеру
+    try:
+        await send_task_with_files_to_designer(bot, designer_id, task)
+    except Exception:
+        pass
+
+    # 2. Уведомляем заказчика
+    designer_link = build_user_link(designer_display_name, designer_username, designer_id)
+    try:
+        creator_notice = await bot.send_message(
+            chat_id=task["creator_id"],
+            text=(
+                f"🎨 Вашу задачу <b>#{task_id}</b> («{html.escape(task['theme'])}») взял(-а) в работу дизайнер {designer_link}!"
+            ),
+            disable_web_page_preview=True
+        )
+        pending_async_notices.setdefault(task["creator_id"], []).append(creator_notice.message_id)
+    except Exception:
+        pass
+
+    return True, "Задача успешно взята в работу!"
+
+
+async def execute_designer_done_task(bot: Bot, task_id: int, designer_id: int, notify_designer_pm: bool = False) -> tuple[bool, str]:
+    """Общая логика отправки задачи на проверку заказчику."""
+    task = await db.get_task(task_id)
+    if not task or task["designer_id"] != designer_id:
+        return False, "Задача не найдена или не закреплена за вами."
+
+    if task["status"] != "in_progress":
+        return False, "Эта задача уже отправлена на проверку или закрыта."
+
+    auto_approve_dt = calculate_next_workday_end_msk()
+    auto_approve_str = auto_approve_dt.strftime("%Y-%m-%d %H:%M:%S")
+    auto_approve_display = auto_approve_dt.strftime("%d.%m.%Y в %H:%M")
+
+    updated = await db.set_task_awaiting_confirmation(task_id, auto_approve_str)
+    if not updated:
+        return False, "Эта задача уже отправлена на проверку."
+
+    designer_user = await db.get_user(designer_id)
+    d_name = designer_user[1] if designer_user else (task.get("designer_name") or "Дизайнер")
+
+    # Если действие вызвано из Mini App — дублируем уведомление в чат дизайнеру
+    if notify_designer_pm:
+        try:
+            await bot.send_message(
+                chat_id=designer_id,
+                text=(
+                    f"⏳ Вы отправили задачу <b>#{task_id}</b> («{html.escape(task['theme'])}») заказчику на проверку через Mini App.\n"
+                    f"Если заказчик не ответит до <b>{auto_approve_display} (UTC+3)</b>, задача закроется автоматически."
+                )
+            )
+        except Exception:
+            pass
+
+    # Уведомление заказчику с кнопками приёмки
+    text_to_creator = (
+        f"🔔 Дизайнер <b>{html.escape(d_name)}</b> отметил(-а) выполнение задачи <b>#{task_id}</b>:\n"
+        f"<b>Тема:</b> {html.escape(task['theme'])}\n\n"
+        f"Пожалуйста, подтвердите приёмку или отправьте на доработку до <b>{auto_approve_display} (UTC+3)</b>.\n"
+        f"<i>При отсутствии ответа задача будет автоматически закрыта как выполненная.</i>"
+    )
+    try:
+        notice = await bot.send_message(
+            chat_id=task["creator_id"],
+            text=text_to_creator,
+            reply_markup=get_creator_confirmation_keyboard(task_id)
+        )
+        pending_async_notices.setdefault(task["creator_id"], []).append(notice.message_id)
+    except Exception:
+        pass
+
+    return True, f"Задача отправлена на проверку (автозакрытие {auto_approve_display} МСК)."
+
+
+async def execute_designer_reject_task(bot: Bot, task_id: int, designer_id: int, notify_designer_pm: bool = False) -> tuple[bool, str]:
+    """Общая логика отказа дизайнера от задачи."""
+    task = await db.get_task(task_id)
+    if not task or task["designer_id"] != designer_id:
+        return False, "Задача не найдена или не принадлежит вам."
+
+    await db.free_task_from_designer(task_id)
+
+    if notify_designer_pm:
+        try:
+            await bot.send_message(
+                chat_id=designer_id,
+                text=f"❌ Вы отказались от задачи <b>#{task_id}</b> («{html.escape(task['theme'])}») через Mini App. Она возвращена в общий чат."
+            )
+        except Exception:
+            pass
+
+    await delete_task_messages_from_group(bot, task_id)
+    await post_task_to_chat(bot, task, task_id)
+    return True, "Вы отказались от задачи. Она возвращена в общий чат."
+
+async def _send_creator_approval_dialog(bot: Bot, task: dict, is_restore: bool = False):
+    d_name = task.get("designer_name") or "Дизайнер"
+    auto_note = ""
+    if task.get("auto_approve_at"):
+        try:
+            aa_dt = datetime.fromisoformat(task["auto_approve_at"])
+            auto_note = f" до <b>{aa_dt.strftime('%d.%m.%Y в %H:%M')} (UTC+3)</b>"
+        except Exception:
+            pass
+
+    prefix = "🔄 <b>Восстановлено окно подтверждения задачи</b>" if is_restore else "🔔"
+    text_to_creator = (
+        f"{prefix} Дизайнер <b>{html.escape(d_name)}</b> отметил(-а) выполнение задачи <b>#{task['id']}</b>:\n"
+        f"<b>Тема:</b> {html.escape(task['theme'])}\n\n"
+        f"Пожалуйста, подтвердите приёмку или отправьте на доработку{auto_note}.\n"
+        f"<i>При отсутствии ответа задача будет автоматически закрыта как выполненная.</i>"
+    )
+    await bot.send_message(
+        chat_id=task["creator_id"],
+        text=text_to_creator,
+        reply_markup=get_creator_confirmation_keyboard(task["id"])
+    )
+    pending_async_notices.setdefault(task["creator_id"], []).append(notice.message_id)
+
+
+async def restore_active_dialogs_for_user(bot: Bot, user_id: int):
+    """Переотправляет пользователю только диалоговые окна подтверждения выполнения задачи при /start."""
+    awaiting_tasks = await db.get_tasks_awaiting_confirmation_for_creator(creator_id=user_id)
+    for t in awaiting_tasks:
+        try:
+            await _send_creator_approval_dialog(bot, t, is_restore=True)
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+
+
+async def restore_active_dialogs_for_all(bot: Bot):
+    """Переотправляет только диалоговые окна подтверждения выполнения задачи при запуске/перезапуске бота."""
+    # Доотправляем в общий чат задачи pending, если сбой произошёл до их первой публикации
+    unposted = await db.get_unposted_pending_tasks()
+    for t in unposted:
+        try:
+            await post_task_to_chat(bot, t, t["id"])
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+
+    # Все активные окна подтверждения приёмки для заказчиков
+    awaiting_tasks = await db.get_tasks_awaiting_confirmation_for_creator(creator_id=None)
+    for t in awaiting_tasks:
+        try:
+            await _send_creator_approval_dialog(bot, t, is_restore=True)
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
 
 # ========================================================
 # Регистрация и меню
@@ -348,8 +650,10 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         is_designer_user = is_designer_position(user[2])
         await message.answer(
             f"С возвращением, {user[1]} ({user[2]})!",
-            reply_markup=get_main_menu_keyboard(is_admin_user, is_designer_user)
+            reply_markup=get_main_menu_keyboard(is_admin_user, is_designer_user, user_id=message.from_user.id)
         )
+        # Переотправляем все активные диалоговые окна этого пользователя
+        await restore_active_dialogs_for_user(bot, message.from_user.id)
 
 
 @router.message(RegistrationState.waiting_for_full_name)
@@ -392,12 +696,12 @@ async def process_position(message: Message, state: FSMContext, bot: Bot):
     await track_msg(state, message.message_id)
     await cleanup_fsm_messages(bot, message.chat.id, state)
     await state.clear()
-    
+
     is_admin_user = config.is_admin(message.from_user.id)
     is_designer_user = is_designer_position(position)
     sent = await message.answer(
         "✅ Регистрация завершена!",
-        reply_markup=get_main_menu_keyboard(is_admin_user, is_designer_user)
+        reply_markup=get_main_menu_keyboard(is_admin_user, is_designer_user, user_id=message.from_user.id)
     )
     asyncio.create_task(delete_later(bot, message.chat.id, sent.message_id, 7))
 
@@ -420,20 +724,79 @@ async def show_my_tasks(message: Message, bot: Bot):
 
     tasks = await db.get_user_tasks(message.from_user.id)
     if not tasks:
-        empty_msg = await message.answer("У вас нет активных задач в работе или ожидании.")
+        empty_msg = await message.answer("У вас нет активных или недавно завершённых задач.")
         asyncio.create_task(delete_later(bot, message.chat.id, empty_msg.message_id, 7))
         return
 
     new_list_ids = []
-    header = await message.answer(f"📋 <b>Ваши активные задачи ({len(tasks)}):</b>")
+    header = await message.answer(f"📋 <b>Ваши задачи ({len(tasks)}):</b>")
     new_list_ids.append(header.message_id)
 
     for t in tasks:
-        card = format_user_card_text(dict(t))
-        card_msg = await message.answer(card, reply_markup=get_user_task_item_keyboard(t["id"]))
+        t_dict = dict(t)
+        card = format_user_card_text(t_dict)
+        if t_dict["status"] == "completed":
+            kb = get_completed_task_reopen_keyboard(t_dict["id"])
+        else:
+            kb = get_user_task_item_keyboard(t_dict["id"])
+        card_msg = await message.answer(card, reply_markup=kb)
         new_list_ids.append(card_msg.message_id)
 
     user_my_tasks_messages[message.from_user.id] = new_list_ids
+
+
+@router.callback_query(F.data.startswith("creator_reopen_"))
+async def reopen_task_by_creator(callback: CallbackQuery, bot: Bot):
+    await clear_user_pending_notices(bot, callback.from_user.id)
+    task_id = int(callback.data.split("_")[2])
+    task = await db.get_task(task_id)
+
+    if not task or task["creator_id"] != callback.from_user.id:
+        await callback.answer("⛔ Задача не найдена или чужая.", show_alert=True)
+        return
+
+    if task["status"] != "completed":
+        await callback.answer("Эта задача уже активна.", show_alert=True)
+        return
+
+    # Проверяем, не прошло ли 7 дней с момента закрытия
+    if task.get("completed_at"):
+        try:
+            comp_dt = datetime.strptime(task["completed_at"], "%Y-%m-%d %H:%M:%S")
+            if now_msk() - comp_dt > timedelta(days=7):
+                await callback.answer("⏳ Срок переоткрытия задачи (7 дней) уже истёк.", show_alert=True)
+                return
+        except ValueError:
+            pass
+
+    has_designer = bool(task.get("designer_id"))
+    await db.reopen_task_db(task_id, has_designer=has_designer)
+
+    updated_task = await db.get_task(task_id)
+    new_card = format_user_card_text(updated_task)
+
+    await callback.answer("Задача переоткрыта и отправлена на правки!")
+    await callback.message.edit_text(
+        new_card,
+        reply_markup=get_user_task_item_keyboard(task_id)
+    )
+
+    if has_designer:
+        try:
+            notice = await bot.send_message(
+                chat_id=task["designer_id"],
+                text=(
+                    f"🔄 <b>Заказчик переоткрыл(-а) задачу #{task_id} («{html.escape(task['theme'])}») для дополнительных правок!</b>\n"
+                    f"Задача снова в вашем списке «💼 Мои задачи в работе»."
+                ),
+                reply_markup=get_designer_task_control_keyboard(task_id)
+            )
+            pending_async_notices.setdefault(task["designer_id"], []).append(notice.message_id)
+        except Exception:
+            pass
+    else:
+        # Если задача была закрыта без дизайнера — публикуем обратно в общий чат
+        await post_task_to_chat(bot, updated_task, task_id)
 
 
 @router.callback_query(F.data.startswith("creator_cancel_"))
@@ -468,7 +831,6 @@ async def cancel_task_by_creator(callback: CallbackQuery, bot: Bot):
     asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
 
 
-# Редактирование Дедлайна в "Моих задачах"
 @router.callback_query(F.data.startswith("creator_edit_deadline_"))
 async def start_edit_deadline(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await clear_user_pending_notices(bot, callback.from_user.id)
@@ -488,7 +850,7 @@ async def start_edit_deadline(callback: CallbackQuery, state: FSMContext, bot: B
 
     await callback.answer()
     prompt = await callback.message.answer(
-        f"📅 Введите новый дедлайн для задачи <b>#{task_id}</b> («{html.escape(task['theme'])}»):\n"
+        f"📅 Введите новый дедлайн (UTC+3) для задачи <b>#{task_id}</b> («{html.escape(task['theme'])}»):\n"
         f"<i>Текущий дедлайн: {html.escape(task['deadline'])}</i>\n\n"
         f"Пример: <code>15.11 18:00</code>"
     )
@@ -544,7 +906,6 @@ async def process_new_deadline(message: Message, state: FSMContext, bot: Bot):
     confirm_msg = await message.answer(f"✅ Дедлайн задачи #{task_id} изменён на <b>{html.escape(raw_deadline)}</b>!")
     asyncio.create_task(delete_later(bot, message.chat.id, confirm_msg.message_id, 5))
 
-    # Уведомление дизайнеру об изменении дедлайна
     if task["designer_id"]:
         try:
             notice = await bot.send_message(
@@ -559,7 +920,6 @@ async def process_new_deadline(message: Message, state: FSMContext, bot: Bot):
             pass
 
 
-# Редактирование ТЗ в "Моих задачах"
 @router.callback_query(F.data.startswith("creator_edit_desc_"))
 async def start_edit_description(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await clear_user_pending_notices(bot, callback.from_user.id)
@@ -630,7 +990,6 @@ async def process_new_description(message: Message, state: FSMContext, bot: Bot)
     confirm_msg = await message.answer(f"✅ ТЗ для задачи #{task_id} успешно обновлено!")
     asyncio.create_task(delete_later(bot, message.chat.id, confirm_msg.message_id, 5))
 
-    # Уведомление дизайнеру об изменении ТЗ
     if task["designer_id"]:
         try:
             notice = await bot.send_message(
@@ -701,6 +1060,150 @@ async def show_designer_tasks(message: Message, bot: Bot):
 
 
 # ========================================================
+# Управление задачами Админом
+# ========================================================
+
+@router.message(F.chat.type == "private", F.text == "🛠 Управление задачами")
+async def admin_manage_tasks(message: Message, bot: Bot):
+    await handle_user_command_cleanup(bot, message.chat.id, message.from_user.id, message.message_id)
+
+    if not config.is_admin(message.from_user.id):
+        return
+
+    prev_messages = admin_manage_tasks_messages.get(message.from_user.id, [])
+    for mid in prev_messages:
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=mid)
+        except Exception:
+            pass
+    admin_manage_tasks_messages[message.from_user.id] = []
+
+    tasks = await db.get_all_active_tasks()
+    if not tasks:
+        empty_msg = await message.answer("Активных задач для управления сейчас нет.")
+        asyncio.create_task(delete_later(bot, message.chat.id, empty_msg.message_id, 7))
+        return
+
+    status_names = {
+        "pending": "⏳ Ищет дизайнера",
+        "in_progress": "🛠 В работе",
+        "awaiting_confirmation": "🧐 На проверке у заказчика"
+    }
+
+    new_list_ids = []
+    header = await message.answer(f"🛠 <b>Активные задачи ({len(tasks)}):</b>")
+    new_list_ids.append(header.message_id)
+
+    for t in tasks:
+        t_dict = dict(t)
+        designer_str = html.escape(t_dict["designer_name"]) if t_dict.get("designer_name") else "Не назначен"
+        time_left = calculate_time_left(t_dict.get("deadline_dt"), t_dict.get("deadline", ""))
+        card = (
+            f"<b>Задача #{t_dict['id']}: {html.escape(t_dict['theme'])}</b>\n"
+            f"<b>Статус:</b> {status_names.get(t_dict['status'], t_dict['status'])}\n"
+            f"<b>Заказчик:</b> {html.escape(t_dict['creator_name'])}\n"
+            f"<b>Дизайнер:</b> {designer_str}\n"
+            f"<b>Дедлайн:</b> {html.escape(t_dict['deadline'])} (осталось: <code>{time_left}</code>)"
+        )
+        card_msg = await message.answer(card, reply_markup=get_admin_task_control_keyboard(t_dict["id"]))
+        new_list_ids.append(card_msg.message_id)
+
+    admin_manage_tasks_messages[message.from_user.id] = new_list_ids
+
+
+@router.callback_query(F.data.startswith("admin_close_"))
+async def admin_close_task(callback: CallbackQuery, bot: Bot):
+    if not config.is_admin(callback.from_user.id):
+        await safe_callback_answer(callback, "⛔ Нет прав администратора.", show_alert=True)
+        return
+
+    task_id = int(callback.data.split("_")[2])
+    task = await db.get_task(task_id)
+    if not task or task["status"] in ("completed", "canceled"):
+        await safe_callback_answer(callback, "Задача уже закрыта или удалена.", show_alert=True)
+        return
+
+    await db.complete_task_db(task_id)
+    # Отвечаем на клик СРАЗУ, до удаления сообщений в общем чате
+    await safe_callback_answer(callback, "Задача закрыта как выполненная!")
+
+    try:
+        await callback.message.edit_text(
+            f"✅ <b>Задача #{task_id} («{html.escape(task['theme'])}») закрыта администратором как выполненная.</b>"
+        )
+        asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    except Exception:
+        pass
+
+    await delete_task_messages_from_group(bot, task_id)
+
+    try:
+        notice_c = await bot.send_message(
+            chat_id=task["creator_id"],
+            text=f"✅ Администратор закрыл задачу <b>#{task_id}</b> («{html.escape(task['theme'])}») как выполненную."
+        )
+        pending_async_notices.setdefault(task["creator_id"], []).append(notice_c.message_id)
+    except Exception:
+        pass
+
+    if task.get("designer_id"):
+        try:
+            notice_d = await bot.send_message(
+                chat_id=task["designer_id"],
+                text=f"✅ Администратор закрыл задачу <b>#{task_id}</b> («{html.escape(task['theme'])}») как выполненную. Она засчитана в вашу статистику!"
+            )
+            pending_async_notices.setdefault(task["designer_id"], []).append(notice_d.message_id)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.startswith("admin_delete_"))
+async def admin_delete_task(callback: CallbackQuery, bot: Bot):
+    if not config.is_admin(callback.from_user.id):
+        await safe_callback_answer(callback, "⛔ Нет прав администратора.", show_alert=True)
+        return
+
+    task_id = int(callback.data.split("_")[2])
+    task = await db.get_task(task_id)
+    if not task or task["status"] in ("completed", "canceled"):
+        await safe_callback_answer(callback, "Задача уже закрыта или удалена.", show_alert=True)
+        return
+
+    await db.cancel_task_db(task_id)
+    # Отвечаем на клик СРАЗУ, до удаления сообщений в общем чате
+    await safe_callback_answer(callback, "Задача удалена (отменена)!")
+
+    try:
+        await callback.message.edit_text(
+            f"🗑 <b>Задача #{task_id} («{html.escape(task['theme'])}») удалена (отменена) администратором.</b>"
+        )
+        asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    except Exception:
+        pass
+
+    await delete_task_messages_from_group(bot, task_id)
+
+    try:
+        notice_c = await bot.send_message(
+            chat_id=task["creator_id"],
+            text=f"🗑 Администратор отменил и удалил задачу <b>#{task_id}</b> («{html.escape(task['theme'])}»)."
+        )
+        pending_async_notices.setdefault(task["creator_id"], []).append(notice_c.message_id)
+    except Exception:
+        pass
+
+    if task.get("designer_id"):
+        try:
+            notice_d = await bot.send_message(
+                chat_id=task["designer_id"],
+                text=f"🗑 Администратор отменил и удалил задачу <b>#{task_id}</b> («{html.escape(task['theme'])}»)."
+            )
+            pending_async_notices.setdefault(task["designer_id"], []).append(notice_d.message_id)
+        except Exception:
+            pass
+
+
+# ========================================================
 # Создание задачи
 # ========================================================
 
@@ -749,7 +1252,7 @@ async def task_description(message: Message, state: FSMContext, bot: Bot):
     await clear_validation_msgs(bot, message.chat.id, state)
     await track_msg(state, message.message_id)
     await state.update_data(description=message.text)
-    sent = await message.answer("Укажите <b>дедлайн</b> (например: <code>15.11 18:00</code>):")
+    sent = await message.answer("Укажите <b>дедлайн по МСК (UTC+3)</b> (например: <code>15.11 18:00</code>):")
     await track_msg(state, sent.message_id)
     await state.set_state(TaskCreationState.waiting_for_deadline)
 
@@ -763,85 +1266,68 @@ async def task_deadline(message: Message, state: FSMContext, bot: Bot):
     await state.update_data(deadline=raw_text, deadline_dt=dt_str, reference_photos=[], reference_docs=[])
 
     sent = await message.answer(
-        "Прикрепите <b>референсы и файлы</b>:\n"
-        "• Можно прикрепить до <b>5 файлов или фото</b> (по одному).\n"
-        "• Можно отправить текстовые ссылки / ссылки на диск, Figma.\n"
-        "• Когда закончите отправку файлов, нажмите <b>«Завершить прикрепление»</b>.",
+        f"Прикрепите <b>референсы и файлы</b>:\n"
+        f"• Можно прикрепить до <b>{MAX_ATTACHMENTS} файлов или фото</b> (по одному или группой).\n"
+        f"• Можно отправить текстовые ссылки / ссылки на диск, Figma.\n"
+        f"• Когда закончите отправку файлов, нажмите <b>«Завершить прикрепление»</b>.",
         reply_markup=get_reference_input_keyboard(has_files=False)
     )
     await track_msg(state, sent.message_id)
     await state.set_state(TaskCreationState.waiting_for_references)
 
 
-@router.message(TaskCreationState.waiting_for_references, F.photo)
-async def task_references_photo(message: Message, state: FSMContext, bot: Bot, album: list[Message] | None = None):
+@router.message(TaskCreationState.waiting_for_references, F.photo | F.document)
+async def task_references_media(message: Message, state: FSMContext, bot: Bot, album: list[Message] | None = None):
+    """Единый обработчик для фото, документов и смешанных медиагрупп (до 10 вложений)."""
     await clear_validation_msgs(bot, message.chat.id, state)
     messages = album if album else [message]
     for msg in messages:
         await track_msg(state, msg.message_id)
 
     data = await state.get_data()
-    photos = data.get("reference_photos", [])
-    docs = data.get("reference_docs", [])
+    photos = list(data.get("reference_photos", []))
+    docs = list(data.get("reference_docs", []))
 
-    if (len(photos) + len(docs)) >= 5:
-        val = await message.answer("⚠️ Уже загружено максимум (5 вложений). Нажмите кнопку «Завершить прикрепление файлов».")
+    if (len(photos) + len(docs)) >= MAX_ATTACHMENTS:
+        val = await message.answer(
+            f"⚠️ Уже загружено максимум ({MAX_ATTACHMENTS} вложений). Нажмите кнопку «Завершить прикрепление файлов»."
+        )
         await track_validation_msg(state, val.message_id)
         return
 
+    added_count = 0
     for msg in messages:
-        if (len(photos) + len(docs)) >= 5:
+        if (len(photos) + len(docs)) >= MAX_ATTACHMENTS:
             break
         if msg.photo:
-            photos.append(msg.photo[-1].file_id)
+            photos.append({
+                "file_id": msg.photo[-1].file_id,
+                "file_name": f"photo_{len(photos) + 1}.jpg"
+            })
+            added_count += 1
+        elif msg.document:
+            docs.append({
+                "file_id": msg.document.file_id,
+                "file_name": msg.document.file_name or f"file_{len(docs) + 1}"
+            })
+            added_count += 1
 
     caption = data.get("reference_data")
     last_caption = next((m.caption.strip() for m in reversed(messages) if m.caption), None)
     if last_caption:
         caption = last_caption
 
-    await state.update_data(reference_type="photo", reference_photos=photos, reference_data=caption)
-
-    total = len(photos) + len(docs)
-    sent = await message.answer(
-        f"📸 Фото добавлено ({total} из 5 вложений). Отправьте ещё или завершите:",
-        reply_markup=get_reference_input_keyboard(has_files=True)
+    ref_type = "photo" if photos else "document"
+    await state.update_data(
+        reference_type=ref_type,
+        reference_photos=photos,
+        reference_docs=docs,
+        reference_data=caption
     )
-    await track_validation_msg(state, sent.message_id)
-
-
-@router.message(TaskCreationState.waiting_for_references, F.document)
-async def task_references_document(message: Message, state: FSMContext, bot: Bot, album: list[Message] | None = None):
-    await clear_validation_msgs(bot, message.chat.id, state)
-    messages = album if album else [message]
-    for msg in messages:
-        await track_msg(state, msg.message_id)
-
-    data = await state.get_data()
-    photos = data.get("reference_photos", [])
-    docs = data.get("reference_docs", [])
-
-    if (len(photos) + len(docs)) >= 5:
-        val = await message.answer("⚠️ Уже загружено максимум (5 вложений). Нажмите кнопку «Завершить прикрепление файлов».")
-        await track_validation_msg(state, val.message_id)
-        return
-
-    for msg in messages:
-        if (len(photos) + len(docs)) >= 5:
-            break
-        if msg.document:
-            docs.append(msg.document.file_id)
-
-    caption = data.get("reference_data")
-    last_caption = next((m.caption.strip() for m in reversed(messages) if m.caption), None)
-    if last_caption:
-        caption = last_caption
-
-    await state.update_data(reference_type="document", reference_docs=docs, reference_data=caption)
 
     total = len(photos) + len(docs)
     sent = await message.answer(
-        f"📄 Файл добавлен ({total} из 5 вложений). Отправьте ещё или завершите:",
+        f"📎 Добавлено вложений: {added_count} (всего <b>{total} из {MAX_ATTACHMENTS}</b>). Отправьте ещё или завершите:",
         reply_markup=get_reference_input_keyboard(has_files=True)
     )
     await track_validation_msg(state, sent.message_id)
@@ -891,7 +1377,7 @@ async def prompt_task_confirmation(message: Message, state: FSMContext):
     photos = data.get("reference_photos", [])
     docs = data.get("reference_docs", [])
     ref_data = data.get("reference_data")
-    
+
     parts = []
     if photos:
         parts.append(f"Фото: {len(photos)} шт.")
@@ -924,7 +1410,6 @@ async def prompt_task_confirmation(message: Message, state: FSMContext):
     await state.set_state(TaskCreationState.waiting_for_confirmation)
 
 
-# Редактирование ТЗ прямо на шаге подтверждения создания
 @router.callback_query(TaskCreationState.waiting_for_confirmation, F.data == "confirm_edit_desc")
 async def creation_edit_desc_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -972,7 +1457,7 @@ async def confirm_and_send_task(callback: CallbackQuery, state: FSMContext, bot:
         "reference_photos": data.get("reference_photos", []),
         "reference_docs": data.get("reference_docs", []),
         "reference_data": data.get("reference_data"),
-        "created_at": datetime.now().strftime("%d.%m.%Y %H:%M")
+        "created_at": now_msk().strftime("%d.%m.%Y %H:%M")
     }
 
     task_id = await db.create_task(task_payload)
@@ -992,6 +1477,8 @@ async def confirm_and_send_task(callback: CallbackQuery, state: FSMContext, bot:
 async def take_task_handler(callback: CallbackQuery, bot: Bot):
     await clear_user_pending_notices(bot, callback.from_user.id)
     task_id = int(callback.data.split("_")[2])
+    ok, msg = await execute_designer_take_task(bot, task_id, callback.from_user.id, callback.from_user.username)
+    await callback.answer(msg, show_alert=not ok)
     designer_id = callback.from_user.id
 
     designer_user = await db.get_user(designer_id)
@@ -1022,26 +1509,13 @@ async def take_task_handler(callback: CallbackQuery, bot: Bot):
 
     task = await db.get_task(task_id)
 
-    # 1. Отправляем карточку задачи дизайнеру в ЛС
-    creator_link = build_user_link(task["creator_name"], task.get("creator_username"), task["creator_id"])
-    task_info = format_task_text(task, creator_link)
-    pm_text = (
-        f"🎯 <b>Вы взяли задачу #{task_id}:</b>\n\n"
-        f"{task_info}\n\n"
-        "Когда закончите работу, нажмите «Выполнено». Если передумали — «Отказаться»."
-    )
-
+    # 1. Пересылаем задачу со ВСЕМИ фото/файлами дизайнеру в ЛС и кнопками внизу
     try:
-        await bot.send_message(
-            chat_id=designer_id,
-            text=pm_text,
-            reply_markup=get_designer_task_control_keyboard(task_id),
-            disable_web_page_preview=True
-        )
+        await send_task_with_files_to_designer(bot, designer_id, task)
     except Exception:
         pass
 
-    # 2. Уведомление Заказчику с кликабельной гиперссылкой на дизайнера
+    # 2. Уведомление Заказчику
     designer_link = build_user_link(designer_display_name, designer_username, designer_id)
     try:
         creator_notice = await bot.send_message(
@@ -1064,6 +1538,13 @@ async def take_task_handler(callback: CallbackQuery, bot: Bot):
 async def designer_reject_task(callback: CallbackQuery, bot: Bot):
     await clear_user_pending_notices(bot, callback.from_user.id)
     task_id = int(callback.data.split("_")[2])
+    ok, msg = await execute_designer_reject_task(bot, task_id, callback.from_user.id, notify_designer_pm=False)
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+    await callback.answer("Вы отказались от задачи.")
+    await callback.message.edit_text(f"❌ Вы отказались от задачи #{task_id}.")
+    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
     task = await db.get_task(task_id)
 
     if not task or task["designer_id"] != callback.from_user.id:
@@ -1084,25 +1565,41 @@ async def designer_reject_task(callback: CallbackQuery, bot: Bot):
 async def designer_done_task(callback: CallbackQuery, bot: Bot):
     await clear_user_pending_notices(bot, callback.from_user.id)
     task_id = int(callback.data.split("_")[2])
+    ok, msg = await execute_designer_done_task(bot, task_id, callback.from_user.id, notify_designer_pm=False)
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        return
+    await callback.answer("Отправлено на подтверждение!")
+    await callback.message.edit_text(f"⏳ {msg}")
+    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 7))
     task = await db.get_task(task_id)
 
     if not task or task["designer_id"] != callback.from_user.id:
         await callback.answer("Ошибка доступа.", show_alert=True)
         return
 
-    await db.set_task_awaiting_confirmation(task_id)
+    # Вычисляем 18:00 следующего рабочего дня (UTC+3)
+    auto_approve_dt = calculate_next_workday_end_msk()
+    auto_approve_str = auto_approve_dt.strftime("%Y-%m-%d %H:%M:%S")
+    auto_approve_display = auto_approve_dt.strftime("%d.%m.%Y в %H:%M")
+
+    await db.set_task_awaiting_confirmation(task_id, auto_approve_str)
     await callback.answer("Отправлено на подтверждение!")
 
-    await callback.message.edit_text(f"⏳ Задача #{task_id} отправлена заказчику на проверку.")
-    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    await callback.message.edit_text(
+        f"⏳ Задача #{task_id} отправлена заказчику на проверку.\n"
+        f"Если заказчик не ответит до <b>{auto_approve_display} (UTC+3)</b>, задача закроется автоматически."
+    )
+    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 7))
 
     designer_user = await db.get_user(callback.from_user.id)
     d_name = designer_user[1] if designer_user else callback.from_user.full_name
 
     text_to_creator = (
-        f"🔔 Дизайнер <b>{html.escape(d_name)}</b> отметил(-а) выполнение задачи:\n"
+        f"🔔 Дизайнер <b>{html.escape(d_name)}</b> отметил(-а) выполнение задачи <b>#{task_id}</b>:\n"
         f"<b>Тема:</b> {html.escape(task['theme'])}\n\n"
-        f"Пожалуйста, подтвердите приёмку или отправьте на доработку."
+        f"Пожалуйста, подтвердите приёмку или отправьте на доработку до <b>{auto_approve_display} (UTC+3)</b>.\n"
+        f"<i>При отсутствии ответа задача будет автоматически закрыта как выполненная.</i>"
     )
     try:
         notice = await bot.send_message(
@@ -1125,11 +1622,24 @@ async def creator_approve_task(callback: CallbackQuery, bot: Bot):
         await callback.answer("Ошибка доступа.", show_alert=True)
         return
 
+    if task["status"] == "completed":
+        await callback.answer("Задача уже подтверждена или закрыта автоматически.", show_alert=True)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        return
+
     await db.complete_task_db(task_id)
     await callback.answer("Приёмка подтверждена!")
 
-    await callback.message.edit_text(f"🎉 Задача #{task_id} («{html.escape(task['theme'])}») принята!")
-    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    approved_text = f"🎉 Задача #{task_id} («{html.escape(task['theme'])}») принята!"
+    try:
+        await callback.message.edit_text(approved_text)
+        asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    except Exception:
+        sent = await bot.send_message(chat_id=callback.from_user.id, text=approved_text)
+        asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, 5))
 
     await delete_task_messages_from_group(bot, task_id)
 
@@ -1154,20 +1664,32 @@ async def creator_rework_task(callback: CallbackQuery, bot: Bot):
         await callback.answer("Ошибка доступа.", show_alert=True)
         return
 
+    if task["status"] == "completed":
+        await callback.answer("Задача уже закрыта.", show_alert=True)
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        return
+
     await db.rework_task_db(task_id)
     await callback.answer("Отправлено на доработку.")
 
-    await callback.message.edit_text(f"🔄 Задача #{task_id} возвращена дизайнеру на доработку.")
-    asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    rework_text = f"🔄 Задача #{task_id} возвращена дизайнеру на доработку."
+    try:
+        await callback.message.edit_text(rework_text)
+        asyncio.create_task(delete_later(bot, callback.message.chat.id, callback.message.message_id, 5))
+    except Exception:
+        sent = await bot.send_message(chat_id=callback.from_user.id, text=rework_text)
+        asyncio.create_task(delete_later(bot, sent.chat.id, sent.message_id, 5))
 
     if task["designer_id"]:
         try:
-            notice = await bot.send_message(
+            await bot.send_message(
                 chat_id=task["designer_id"],
                 text=f"⚠️ Заказчик вернул(-а) задачу #{task_id} («{html.escape(task['theme'])}») на доработку.",
                 reply_markup=get_designer_task_control_keyboard(task_id)
             )
-            pending_async_notices.setdefault(task["designer_id"], []).append(notice.message_id)
         except Exception:
             pass
 
@@ -1183,7 +1705,7 @@ async def admin_stats_button(message: Message, bot: Bot):
     if not config.is_admin(message.from_user.id):
         return
 
-    now = datetime.now()
+    now = now_msk()
     start_of_current_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
     stats = await db.get_monthly_designer_stats(start_of_current_month)
 

@@ -1,3 +1,4 @@
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -8,15 +9,33 @@ from aiogram.types import (
 import config
 
 
-def get_main_menu_keyboard(is_admin_user: bool = False, is_designer_user: bool = False) -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton(text="➕ Создать задачу"), KeyboardButton(text="📋 Мои задачи")]
-    ]
+def build_webapp_url_for_user(user_id: int | None) -> str:
+    if not user_id:
+        return config.WEBAPP_URL
+    parsed = urlparse(config.WEBAPP_URL)
+    query = dict(parse_qsl(parsed.query))
+    query["uid"] = str(user_id)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def get_main_menu_keyboard(
+    is_admin_user: bool = False,
+    is_designer_user: bool = False,
+    user_id: int | None = None
+) -> ReplyKeyboardMarkup:
+    buttons = []
+
+    # Кнопки создания и просмотра своих задач скрыты для дизайнеров, но оставлены для заказчиков и админов
+    if not is_designer_user or is_admin_user:
+        buttons.append([
+            KeyboardButton(text="➕ Создать задачу"),
+            KeyboardButton(text="📋 Мои задачи")
+        ])
 
     if is_designer_user or is_admin_user:
         webapp_btn = KeyboardButton(
             text="📊 Таблица задач (Mini App)",
-            web_app=WebAppInfo(url=config.WEBAPP_URL)
+            web_app=WebAppInfo(url=build_webapp_url_for_user(user_id))
         )
         buttons.append([webapp_btn])
 
@@ -24,7 +43,10 @@ def get_main_menu_keyboard(is_admin_user: bool = False, is_designer_user: bool =
         buttons.append([KeyboardButton(text="💼 Мои задачи в работе")])
 
     if is_admin_user:
-        buttons.append([KeyboardButton(text="📊 Статистика")])
+        buttons.append([
+            KeyboardButton(text="📊 Статистика"),
+            KeyboardButton(text="🛠 Управление задачами")
+        ])
 
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
@@ -100,6 +122,26 @@ def get_user_task_item_keyboard(task_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="❌ Отменить эту задачу", callback_data=f"creator_cancel_{task_id}")
+            ]
+        ]
+    )
+
+
+def get_admin_task_control_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Закрыть (выполнена)", callback_data=f"admin_close_{task_id}"),
+                InlineKeyboardButton(text="🗑 Удалить (отменить)", callback_data=f"admin_delete_{task_id}")
+            ]
+        ]
+    )
+
+def get_completed_task_reopen_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔄 Переоткрыть (на доработку)", callback_data=f"creator_reopen_{task_id}")
             ]
         ]
     )
